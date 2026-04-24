@@ -26,6 +26,12 @@ filter_proxydb_kwargs:
   - ice
   - lake
   - bivalve
+  - marine
+  - sclerosponge
+  - speleothem
+  - borehole
+  - documents
+  - hybrid
 nens: 100
 nobs_lb: 25
 obs_anom_period:
@@ -76,11 +82,15 @@ psm_calib_period:
 ptype_clim_dict:
   bivalve.d18O:
   - tas
+  borehole:
+  - tas
   coral.SrCa:
   - tas
   coral.calc:
   - tas
   coral.d18O:
+  - tas
+  documents:
   - tas
   ground ice.unknown:
   - tas
@@ -100,6 +110,16 @@ ptype_clim_dict:
   - tas
   lake.varve_thickness:
   - tas
+  marine.MgCa:
+  - tas
+  marine.alkenone:
+  - tas
+  marine.other:
+  - tas
+  sclerosponge.d18O:
+  - tas
+  speleothem.d18O:
+  - tas
   tree.MXD:
   - tas
   tree.TRW:
@@ -108,9 +128,11 @@ ptype_clim_dict:
 ptype_forward_dict: {}
 ptype_psm_dict:
   bivalve.d18O: Linear
+  borehole: Linear
   coral.SrCa: Linear
   coral.calc: Linear
   coral.d18O: Linear
+  documents: Linear
   ground ice.unknown: Linear
   ice.d18O: Linear
   ice.dD: Linear
@@ -120,6 +142,11 @@ ptype_psm_dict:
   lake.other: Linear
   lake.reflectance: Linear
   lake.varve_thickness: Linear
+  marine.MgCa: Linear
+  marine.alkenone: Linear
+  marine.other: Linear
+  sclerosponge.d18O: Linear
+  speleothem.d18O: Linear
   tree.MXD: Linear
   tree.TRW: Bilinear
 ptype_season_dict:
@@ -136,6 +163,19 @@ ptype_season_dict:
   - 10
   - 11
   - 12
+  borehole:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
   coral.SrCa:
   - 1
   - 2
@@ -163,6 +203,19 @@ ptype_season_dict:
   - 11
   - 12
   coral.d18O:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  documents:
   - 1
   - 2
   - 3
@@ -280,6 +333,71 @@ ptype_season_dict:
   - 11
   - 12
   lake.varve_thickness:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  marine.MgCa:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  marine.alkenone:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  marine.other:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  sclerosponge.d18O:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  speleothem.d18O:
   - 1
   - 2
   - 3
