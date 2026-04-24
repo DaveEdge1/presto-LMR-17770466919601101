@@ -7,12 +7,21 @@ RDF graph (avoids writing custom SPARQL with fragile property paths), then
 maps the flat time-series dicts to cfr.ProxyRecord objects.
 
 Usage:
-    python lipd_to_pdb.py <lipd_files.zip> <output_lipd_cfr.pkl>
+    python lipd_to_pdb.py <lipd_files.zip> <output_lipd_cfr.pkl> [query_params.json]
+
+When query_params.json is supplied, rows whose `paleoData_TSid` is not in
+`tsids - removedTsids` are skipped. pylipd stores presto's TSID under
+`paleoData_TSid` (capital T, lowercase id), not `TSID` or `paleoData_TSID`.
+Without this positive filter every sibling paleoData column in each .lpd
+leaks in (sampleCount, EPS, RBAR, segmentLength, correlationCoefficient,
+plus alternate chronology flavors like ARSTAN / residualChronology) and
+each gets its own PSM and Kalman update downstream.
 """
 
 import sys
 import os
 import re
+import json
 import math
 import zipfile
 import tempfile
@@ -260,8 +269,22 @@ def main():
 
     zip_path    = sys.argv[1]
     output_path = sys.argv[2]
+    query_path  = sys.argv[3] if len(sys.argv) > 3 else None
     print(f"Input:  {zip_path}")
     print(f"Output: {output_path}")
+
+    # Optional TSID filter from query_params.json — pylipd exposes presto's
+    # TSID under `paleoData_TSid` (not `TSID` / `paleoData_TSID`).
+    requested_tsids = None
+    if query_path:
+        if not os.path.exists(query_path):
+            raise FileNotFoundError(f"query_params.json not found: {query_path}")
+        with open(query_path) as qpf:
+            qp = json.load(qpf)
+        requested_tsids = (set(qp.get('tsids') or [])
+                           - set(qp.get('removedTsids') or []))
+        print(f"TSID filter: {len(requested_tsids)} TSIDs requested "
+              f"({len(qp.get('removedTsids') or [])} explicitly removed)")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         print(f"\nUnzipping {zip_path} ...")
@@ -323,10 +346,22 @@ def main():
 
     # ── Build DataFrame (cfr.ProxyDatabase.fetch expects pd.read_pickle → from_df) ──
     df_rows = []
-    n_ok    = 0
-    n_skip  = 0
+    n_ok            = 0
+    n_skip          = 0
+    n_skip_tsid     = 0
+    n_skip_no_tsid  = 0
 
     for row in rows:
+        tsid = row.get('paleoData_TSid')
+        if not tsid:
+            n_skip_no_tsid += 1
+            n_skip += 1
+            continue
+        if requested_tsids is not None and tsid not in requested_tsids:
+            n_skip_tsid += 1
+            n_skip += 1
+            continue
+
         vname = str(row.get('paleoData_variableName') or '').strip()
 
         # Skip time/depth/metadata variables
@@ -382,9 +417,9 @@ def main():
         archive  = str(row.get('archiveType') or row.get('archive') or '')
         ptype    = create_ptype(archive, std_name)
 
-        # Record ID
-        pid = str(row.get('TSID') or row.get('paleoData_TSID') or
-                  row.get('dataSetName') or f'record_{n_ok}')
+        # Record ID — presto's TSID catalog matches pylipd's `paleoData_TSid`
+        # (capital T, lowercase id). Already validated above against the filter.
+        pid = str(tsid)
 
         df_rows.append({
             'paleoData_pages2kID':    pid,
@@ -400,6 +435,9 @@ def main():
         n_ok += 1
 
     print(f"\nProxy records: {n_ok} added, {n_skip} skipped")
+    if requested_tsids is not None:
+        print(f"  rejected by TSID filter: {n_skip_tsid}")
+    print(f"  rows missing paleoData_TSid: {n_skip_no_tsid}")
 
     if n_ok == 0:
         raise RuntimeError(
