@@ -9,22 +9,23 @@ maps the flat time-series dicts to cfr.ProxyRecord objects.
 Usage:
     python lipd_to_pdb.py <lipd_files.zip> <output_lipd_cfr.pkl> [query_params.json]
 
-When query_params.json is supplied, rows whose `paleoData_TSid` is not in
-`tsids - removedTsids` are skipped. pylipd stores presto's TSID under
-`paleoData_TSid` (capital T, lowercase id), not `TSID` or `paleoData_TSID`.
-Without this positive filter every sibling paleoData column in each .lpd
-leaks in (sampleCount, EPS, RBAR, segmentLength, correlationCoefficient,
-plus alternate chronology flavors like ARSTAN / residualChronology) and
-each gets its own PSM and Kalman update downstream.
+When query_params.json is supplied, only rows whose `paleoData_TSid` is in
+`tsids - removedTsids` are retained. pylipd stores the presto-catalog TSID
+under `paleoData_TSid` (capital T, lowercase id) — not `TSID` or
+`paleoData_TSID`. Without this positive filter, every sibling paleoData
+column in each .lpd leaks in (sampleCount, EPS, RBAR, segmentLength,
+correlationCoefficient, ARSTAN / residualChronology flavors of the same
+chronology), each getting its own PSM and Kalman update downstream.
 """
 
 import sys
 import os
 import re
-import json
 import math
+import json
 import zipfile
 import tempfile
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -269,22 +270,30 @@ def main():
 
     zip_path    = sys.argv[1]
     output_path = sys.argv[2]
-    query_path  = sys.argv[3] if len(sys.argv) > 3 else None
+    qp_path     = sys.argv[3] if len(sys.argv) > 3 else None
     print(f"Input:  {zip_path}")
     print(f"Output: {output_path}")
 
-    # Optional TSID filter from query_params.json — pylipd exposes presto's
-    # TSID under `paleoData_TSid` (not `TSID` / `paleoData_TSID`).
+    # Load TSID filter from query_params.json if provided. When present,
+    # `requested_tsids` is the positive whitelist (tsids - removedTsids); rows
+    # whose `paleoData_TSid` is not in this set are rejected.
     requested_tsids = None
-    if query_path:
-        if not os.path.exists(query_path):
-            raise FileNotFoundError(f"query_params.json not found: {query_path}")
-        with open(query_path) as qpf:
-            qp = json.load(qpf)
-        requested_tsids = (set(qp.get('tsids') or [])
-                           - set(qp.get('removedTsids') or []))
-        print(f"TSID filter: {len(requested_tsids)} TSIDs requested "
-              f"({len(qp.get('removedTsids') or [])} explicitly removed)")
+    removed_tsids = set()
+    if qp_path and os.path.isfile(qp_path):
+        print(f"Query params: {qp_path}")
+        with open(qp_path) as f:
+            qp = json.load(f)
+        removed_tsids = set(qp.get('removedTsids') or [])
+        requested = set(qp.get('tsids') or [])
+        if requested:
+            requested_tsids = requested - removed_tsids
+            print(f"  TSID whitelist: {len(requested_tsids)} requested "
+                  f"({len(removed_tsids)} explicitly removed)")
+        elif removed_tsids:
+            print(f"  Will remove {len(removed_tsids)} TSIDs from removedTsids list "
+                  f"(no positive whitelist)")
+    else:
+        print("Query params: not provided (TSID filter disabled)")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         print(f"\nUnzipping {zip_path} ...")
@@ -293,14 +302,26 @@ def main():
         n_files = sum(1 for f in os.listdir(tmpdir) if f.endswith('.lpd'))
         print(f"Extracted {n_files} .lpd files")
 
-        print("\nLoading with pylipd ...")
-        L = LiPD()
-        L.load_from_dir(tmpdir)
-        all_ds = L.get_all_dataset_names()
+        print("\nLoading with pylipd (muting verbose output) ...")
+        with open(os.devnull, 'w') as devnull:
+            _real_stdout, _real_stderr = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = devnull, devnull
+            try:
+                L = LiPD()
+                L.load_from_dir(tmpdir)
+                all_ds = L.get_all_dataset_names()
+            finally:
+                sys.stdout, sys.stderr = _real_stdout, _real_stderr
         print(f"Loaded {len(all_ds)} datasets")
 
-        print("\nExtracting time series via pylipd get_timeseries() ...")
-        result = L.get_timeseries(all_ds)
+        print("Extracting time series via pylipd get_timeseries() ...")
+        with open(os.devnull, 'w') as devnull:
+            _real_stdout, _real_stderr = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = devnull, devnull
+            try:
+                result = L.get_timeseries(all_ds)
+            finally:
+                sys.stdout, sys.stderr = _real_stdout, _real_stderr
 
         # Normalise whatever get_timeseries() returns into a flat list of dicts.
         # pylipd API has varied across versions:
@@ -338,47 +359,72 @@ def main():
             )
         print(f"Got {len(rows)} time series")
 
-        # Print available keys from first row for diagnostics
-        if rows:
-            sample_keys = [k for k in rows[0].keys()
-                           if not str(rows[0].get(k, '')).startswith('[')]
-            print(f"Sample row keys: {sample_keys[:30]}")
+    # ── Pre-filter: separate proxy candidates from time/depth/metadata rows ──
+    proxy_rows = []
+    n_meta = 0
+    for row in rows:
+        vname = str(row.get('paleoData_variableName') or '').strip()
+        if not vname or _is_time_var(vname) or _is_skip_var(vname):
+            n_meta += 1
+            continue
+        proxy_rows.append(row)
+    print(f"Filtered {n_meta} time/depth/metadata rows, {len(proxy_rows)} proxy candidates remain")
 
     # ── Build DataFrame (cfr.ProxyDatabase.fetch expects pd.read_pickle → from_df) ──
     df_rows = []
-    n_ok            = 0
-    n_skip          = 0
-    n_skip_tsid     = 0
-    n_skip_no_tsid  = 0
+    n_ok    = 0
+    n_skip  = 0
 
-    for row in rows:
+    SKIP_MISSING_VALUES  = 'missing proxy values'
+    SKIP_MISSING_TIME    = 'missing time axis'
+    SKIP_ALL_NAN         = 'no valid time-value pairs (all NaN)'
+    SKIP_CONSTANT        = 'constant value (zero variance → EnKF blow-up)'
+    SKIP_BAD_COORDS      = 'missing/invalid coordinates'
+    SKIP_REMOVED_TSID    = 'user-removed TSID (removedTsids)'
+    SKIP_NOT_REQUESTED   = 'TSID not in query_params.tsids whitelist'
+    SKIP_NO_TSID         = 'row has no paleoData_TSid'
+
+    skip_records = []              # per-record details for CSV
+
+    def _skip(reason, row, archive=None):
+        nonlocal n_skip
+        n_skip += 1
+        arch = archive or str(row.get('archiveType') or row.get('archive') or 'unknown').lower().strip()
+        skip_records.append({
+            'dataSetName': str(row.get('dataSetName') or ''),
+            'TSID': str(row.get('paleoData_TSid') or ''),
+            'variableName': str(row.get('paleoData_variableName') or ''),
+            'archiveType': arch,
+            'reason': reason,
+        })
+
+    for row in proxy_rows:
+        vname = str(row.get('paleoData_variableName') or '').strip()
+        archive = str(row.get('archiveType') or row.get('archive') or '').lower().strip()
+
+        # Apply TSID filter first (before expensive array work). pylipd exposes
+        # presto's TSID under `paleoData_TSid` — not `TSID` or `paleoData_TSID`.
         tsid = row.get('paleoData_TSid')
         if not tsid:
-            n_skip_no_tsid += 1
-            n_skip += 1
+            _skip(SKIP_NO_TSID, row, archive)
             continue
         if requested_tsids is not None and tsid not in requested_tsids:
-            n_skip_tsid += 1
-            n_skip += 1
+            _skip(SKIP_NOT_REQUESTED, row, archive)
             continue
-
-        vname = str(row.get('paleoData_variableName') or '').strip()
-
-        # Skip time/depth/metadata variables
-        if not vname or _is_time_var(vname) or _is_skip_var(vname):
-            n_skip += 1
+        if removed_tsids and tsid in removed_tsids:
+            _skip(SKIP_REMOVED_TSID, row, archive)
             continue
 
         # Proxy values
         val_arr = _to_float_array(row.get('paleoData_values'))
         if val_arr is None:
-            n_skip += 1
+            _skip(SKIP_MISSING_VALUES, row, archive)
             continue
 
         # Time axis
         time_raw, time_vname = _get_time_from_row(row)
         if time_raw is None:
-            n_skip += 1
+            _skip(SKIP_MISSING_TIME, row, archive)
             continue
         time_arr = time_to_year_ce(time_raw, time_vname,
                                     row.get('time_standardName', ''))
@@ -388,7 +434,7 @@ def main():
         time_arr, val_arr = time_arr[:n], val_arr[:n]
         mask = np.isfinite(time_arr) & np.isfinite(val_arr)
         if not mask.any():
-            n_skip += 1
+            _skip(SKIP_ALL_NAN, row, archive)
             continue
         time_arr, val_arr = time_arr[mask], val_arr[mask]
         idx = np.argsort(time_arr)
@@ -397,7 +443,7 @@ def main():
         # Skip constant-value records: OLS slope=0 → varye=0, MSE=0 → ob_err=0
         # → kdenom=0 → EnKF Kalman gain blows up
         if np.std(val_arr) < 1e-6:
-            n_skip += 1
+            _skip(SKIP_CONSTANT, row, archive)
             continue
 
         # Coordinates
@@ -406,7 +452,7 @@ def main():
             lon  = _get_scalar(row, 'geo_meanLon',  'geo_meanLongitude', 'longitude')
             elev = _get_scalar(row, 'geo_meanElev', 'geo_meanElevation', 'elevation')
         except Exception:
-            n_skip += 1
+            _skip(SKIP_BAD_COORDS, row, archive)
             continue
 
         # Proxy type
@@ -414,11 +460,10 @@ def main():
                        row.get('paleoData_proxy')         or
                        row.get('paleoData_proxyGeneral')  or
                        vname)
-        archive  = str(row.get('archiveType') or row.get('archive') or '')
         ptype    = create_ptype(archive, std_name)
 
-        # Record ID — presto's TSID catalog matches pylipd's `paleoData_TSid`
-        # (capital T, lowercase id). Already validated above against the filter.
+        # Record ID — already validated as non-empty above; use it directly
+        # so the pid matches the presto TSID catalog exactly.
         pid = str(tsid)
 
         df_rows.append({
@@ -434,10 +479,18 @@ def main():
         })
         n_ok += 1
 
-    print(f"\nProxy records: {n_ok} added, {n_skip} skipped")
-    if requested_tsids is not None:
-        print(f"  rejected by TSID filter: {n_skip_tsid}")
-    print(f"  rows missing paleoData_TSid: {n_skip_no_tsid}")
+    print(f"\nProxy records: {n_ok} added, {n_skip} skipped (of {len(proxy_rows)} candidates)")
+
+    # ── Skip reason breakdown ────────────────────────────────────────────────
+    if skip_records:
+        skip_df = pd.DataFrame(skip_records)
+        reason_counts = skip_df['reason'].value_counts()
+        print("\nSkipped records breakdown by reason:")
+        for reason, count in reason_counts.items():
+            print(f"  {reason:<50} {count:>4} records")
+            arch_counts = skip_df[skip_df['reason'] == reason]['archiveType'].value_counts()
+            for arch, cnt in arch_counts.items():
+                print(f"    {arch:<48} {cnt:>4}")
 
     if n_ok == 0:
         raise RuntimeError(
@@ -451,6 +504,24 @@ def main():
     print("\nProxy type breakdown:")
     for pt, cnt in ptypes.items():
         print(f"  {pt:<40} {cnt:>4} records")
+
+    # ── Save CSVs to prepare-data/ directory ─────────────────────────────────
+    output_dir = os.path.dirname(output_path)
+    prep_dir = os.path.join(output_dir, 'prepare-data')
+    os.makedirs(prep_dir, exist_ok=True)
+
+    skip_csv = os.path.join(prep_dir, 'skipped_records.csv')
+    if skip_records:
+        skip_df.to_csv(skip_csv, index=False)
+        print(f"\nSaved {len(skip_records)} skipped records to {skip_csv}")
+    else:
+        pd.DataFrame(columns=['dataSetName', 'TSID', 'variableName', 'archiveType', 'reason']).to_csv(skip_csv, index=False)
+        print(f"\nNo skipped records — saved empty {skip_csv}")
+
+    ptype_csv = os.path.join(prep_dir, 'proxy_type_breakdown.csv')
+    ptype_df = pd.DataFrame({'ptype': ptypes.index, 'count': ptypes.values})
+    ptype_df.to_csv(ptype_csv, index=False)
+    print(f"Saved proxy type breakdown to {ptype_csv}")
 
     print(f"\nSaving proxy DataFrame to {output_path} ...")
     df.to_pickle(output_path)
