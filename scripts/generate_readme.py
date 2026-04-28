@@ -163,7 +163,7 @@ def _cleaning_bullet(summary):
         ". See [`cleaning_report.json`](cleaning_report.json) for per-record decisions."
     )
     return (
-        "**Pre-query data cleaning ([PReSto data-cleaning app]"
+        "**Data cleaning ([PReSto data-cleaning app]"
         "(https://paleopresto.com)):** " + "".join(parts)
     )
 
@@ -256,6 +256,14 @@ def build_readme(query, configs, *, cleaning_report=None,
     cleaning_bullet = _cleaning_bullet(cleaning_summary)
     if cleaning_bullet:
         lines.append(f"- {cleaning_bullet}")
+    if pages_url:
+        validation_url = pages_url.rstrip("/") + "/validation/index.html"
+        lines.append(
+            "- **Comparison vs PReSto2k:** see the *Proxy Database vs "
+            f"PReSto2k* section of the [validation page]({validation_url}) "
+            "for the per-compilation overlap, archive/ptype breakdown, and "
+            "spatial/temporal coverage relative to the PReSto2k reference."
+        )
     lines.append("")
     lines.append("(See `query_params.json` for the full TSID list.)")
     lines.append("")
