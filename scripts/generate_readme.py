@@ -1,12 +1,14 @@
 """Regenerate README.md for a custom PReSto LMR reconstruction.
 
-Reads `query_params.json` and `lmr_configs.yml` from the repo root and writes
-a `README.md` that surfaces the run-specific data selection and reconstruction
-parameters, plus standard attribution to the LMR Template and PReSto.
+Reads `query_params.json`, `lmr_configs.yml`, and (if present)
+`cleaning_report.json` and `README_NOTES.md` from the repo root, and writes
+a `README.md` that surfaces the run-specific data selection, data-cleaning
+summary, reconstruction parameters, and any user-authored notes.
 
-The output is a pure function of the two input files — running this twice
-with the same inputs produces byte-identical output, so committing the
-result only creates a diff when the inputs actually change.
+`README_NOTES.md` is the author's escape hatch — its contents are inserted
+verbatim near the top of the README and survive regenerations. Everything
+else in the README is a pure function of the input files, so re-running
+with unchanged inputs is byte-stable.
 """
 from __future__ import annotations
 
@@ -99,7 +101,75 @@ def _format_archives(value):
     return str(value)
 
 
-def build_readme(query, configs):
+def summarize_cleaning(report):
+    """Aggregate a PReSto cleaning_report.json (list of duplicate groups).
+
+    Returns a dict with `groups`, `considered`, `kept`, `removed`, and
+    `top_reason` (string or None) — or None if the report is unrecognized.
+    """
+    if not isinstance(report, list) or not report:
+        return None
+    groups = len(report)
+    considered = kept = removed = 0
+    removals_by_reason = {}
+    for group in report:
+        if not isinstance(group, dict):
+            continue
+        records = group.get("records") or []
+        considered += len(records)
+        n_removed_here = 0
+        for rec in records:
+            decision = (rec.get("decision") or "").strip().lower()
+            if decision == "keep":
+                kept += 1
+            elif decision == "remove":
+                removed += 1
+                n_removed_here += 1
+        if n_removed_here:
+            note = (group.get("notes") or "uncategorized").strip() or "uncategorized"
+            removals_by_reason[note] = removals_by_reason.get(note, 0) + n_removed_here
+
+    top_reason = None
+    if removals_by_reason and removed:
+        note, count = max(removals_by_reason.items(), key=lambda kv: kv[1])
+        if count / removed >= 0.5:
+            top_reason = (note, count)
+
+    return {
+        "groups": groups,
+        "considered": considered,
+        "kept": kept,
+        "removed": removed,
+        "top_reason": top_reason,
+    }
+
+
+def _cleaning_bullet(summary):
+    if not summary or not summary["considered"]:
+        return None
+    parts = [
+        f"{summary['considered']} records reviewed across "
+        f"{summary['groups']} duplicate-detection groups; "
+        f"{summary['removed']} removed"
+    ]
+    if summary["top_reason"]:
+        note, count = summary["top_reason"]
+        for prefix in ("removed by ", "removed "):
+            if note.lower().startswith(prefix):
+                note = note[len(prefix):]
+                break
+        parts.append(f" (predominantly *{note}* — {count} of {summary['removed']})")
+    parts.append(
+        ". See [`cleaning_report.json`](cleaning_report.json) for per-record decisions."
+    )
+    return (
+        "**Pre-query data cleaning ([PReSto data-cleaning app]"
+        "(https://paleopresto.com)):** " + "".join(parts)
+    )
+
+
+def build_readme(query, configs, *, cleaning_report=None,
+                 user_notes=None, pages_url=None):
     mode = (query.get("mode") or "").strip().lower()
     mode_desc = MODE_DESCRIPTIONS.get(mode, mode or "—")
 
@@ -139,6 +209,11 @@ def build_readme(query, configs):
     )
     lines.append("")
 
+    notes_text = (user_notes or "").strip()
+    if notes_text:
+        lines.append(notes_text)
+        lines.append("")
+
     lines.append("## Reconstruction parameters")
     lines.append("")
     lines.append("| Parameter | Value |")
@@ -177,6 +252,10 @@ def build_readme(query, configs):
         lines.append(f"- **Records selected:** {len(tsids)}")
     if removed_tsids:
         lines.append(f"- **Records explicitly excluded:** {len(removed_tsids)}")
+    cleaning_summary = summarize_cleaning(cleaning_report) if cleaning_report else None
+    cleaning_bullet = _cleaning_bullet(cleaning_summary)
+    if cleaning_bullet:
+        lines.append(f"- {cleaning_bullet}")
     lines.append("")
     lines.append("(See `query_params.json` for the full TSID list.)")
     lines.append("")
@@ -187,12 +266,19 @@ def build_readme(query, configs):
         "- Reconstruction NetCDFs are committed to `recons/` after each "
         "successful run."
     )
-    lines.append(
-        "- A validation page (against HadCRUT5 and GISTEMP, with a proxy "
-        "comparison vs PReSto2k) and the interactive visualization are "
-        "deployed to GitHub Pages — see this repository's "
-        "**Settings → Pages** for the deployed URL."
-    )
+    if pages_url:
+        lines.append(
+            "- Validation page (vs HadCRUT5 and GISTEMP, with a proxy "
+            f"comparison vs PReSto2k) and the interactive visualization: "
+            f"<{pages_url}>"
+        )
+    else:
+        lines.append(
+            "- A validation page (against HadCRUT5 and GISTEMP, with a "
+            "proxy comparison vs PReSto2k) and the interactive "
+            "visualization are deployed to GitHub Pages — see this "
+            "repository's **Settings → Pages** for the deployed URL."
+        )
     lines.append("")
 
     lines.append("## Method")
@@ -222,9 +308,12 @@ def build_readme(query, configs):
     lines.append("---")
     lines.append(
         "*This README is regenerated automatically by "
-        "`scripts/generate_readme.py` from `query_params.json` and "
-        "`lmr_configs.yml`. Hand edits will be overwritten on the next run; "
-        "edit the inputs (or the script) instead.*"
+        "`scripts/generate_readme.py` from `query_params.json`, "
+        "`lmr_configs.yml`, and (if present) `cleaning_report.json`. "
+        "Hand edits to this file will be overwritten on the next run — "
+        "to add commentary that survives regenerations, write it in "
+        "`README_NOTES.md` (created at repo root), where it will appear "
+        "verbatim near the top of this page.*"
     )
     lines.append("")
     return "\n".join(lines)
@@ -236,6 +325,17 @@ def main():
                         help="Path to query_params.json (default: %(default)s)")
     parser.add_argument("--configs", default="lmr_configs.yml",
                         help="Path to lmr_configs.yml (default: %(default)s)")
+    parser.add_argument("--cleaning-report", default="cleaning_report.json",
+                        help="Path to cleaning_report.json; silently "
+                             "skipped if missing (default: %(default)s)")
+    parser.add_argument("--notes", default="README_NOTES.md",
+                        help="Path to user-authored notes file inserted "
+                             "verbatim near the top of the README; "
+                             "silently skipped if missing "
+                             "(default: %(default)s)")
+    parser.add_argument("--pages-url",
+                        help="Public GitHub Pages URL for this repo, "
+                             "linked from the Results section.")
     parser.add_argument("--out", default="README.md",
                         help="Output README path (default: %(default)s)")
     args = parser.parse_args()
@@ -255,7 +355,30 @@ def main():
     with configs_path.open("r", encoding="utf-8") as f:
         configs = yaml.safe_load(f)
 
-    text = build_readme(query, configs)
+    cleaning_report = None
+    cleaning_path = Path(args.cleaning_report)
+    if cleaning_path.exists():
+        try:
+            with cleaning_path.open("r", encoding="utf-8") as f:
+                cleaning_report = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"WARN: could not parse {cleaning_path}: {exc}",
+                  file=sys.stderr)
+
+    user_notes = None
+    notes_path = Path(args.notes)
+    if notes_path.exists():
+        try:
+            user_notes = notes_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"WARN: could not read {notes_path}: {exc}", file=sys.stderr)
+
+    text = build_readme(
+        query, configs,
+        cleaning_report=cleaning_report,
+        user_notes=user_notes,
+        pages_url=args.pages_url,
+    )
     Path(args.out).write_text(text, encoding="utf-8")
     print(f"Wrote {args.out} ({len(text):,} bytes)")
     return 0
